@@ -1,0 +1,177 @@
+---
+title: "Causal Final Project"
+author: "Xinyu Diao"
+date: "2023-12-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Step 1. Data Preparation and Cleaning
+```{r}
+library(MASS)
+library(optmatch)
+
+life_expectancy <- read.csv("M:/New York University/Life Expectancy Data.csv")
+#View(life_expectancy)
+life_exp <- na.omit(life_expectancy)
+summary(life_exp)
+dim(life_exp)
+
+dim(life_exp[life_exp$Schooling >= 12,])
+life_exp$Schooling >= 12
+# recode if schooling >= 12,scho_over_12 = 1, else = 0 --- treatment
+life_exp$scho_over_12 <- as.factor(ifelse(life_exp$Schooling >= 12, 1, 0))
+table(life_exp$scho_over_12) # 895 data with 1,  754 with 0
+```
+Step 2: Full matching (because there are not enough control groups to do pair matching or matching with multiple groups)
+```{r}
+# Fit a propensity score using logistic regression
+propscore.model <- glm(scho_over_12 ~ Year + Adult.Mortality + infant.deaths + Alcohol + percentage.expenditure + Hepatitis.B + Measles + BMI + under.five.deaths + Polio + Total.expenditure + Diphtheria + HIV.AIDS + GDP + Population + thinness..1.19.years + thinness.5.9.years + Income.composition.of.resources, family = binomial, data = life_exp)
+summary(propscore.model)
+
+life_exp$outcome <- life_exp$Life.expectancy
+life_exp$treated <- propscore.model$y
+treated <- life_exp$treated
+life_exp$logit.ps <- predict(propscore.model)
+
+diff.propensity.score.mat <- outer(life_exp$logit.ps[life_exp$treated==1], life_exp$logit.ps[life_exp$treated==0],'-')
+distmat.propensity <- abs(diff.propensity.score.mat)
+
+rownames(distmat.propensity) <- rownames(life_exp)[life_exp$treated==1]
+colnames(distmat.propensity) <- rownames(life_exp)[life_exp$treated==0]
+
+# Matrix of covariates, excluding intercept
+Xmat <- model.matrix(scho_over_12 ~ Year + Adult.Mortality + infant.deaths + Alcohol + percentage.expenditure + Hepatitis.B + Measles + BMI + under.five.deaths + Polio + Total.expenditure + Diphtheria + HIV.AIDS + GDP + Population + thinness..1.19.years + thinness.5.9.years + Income.composition.of.resources, family = binomial, data = life_exp)
+Xmat <- Xmat[,-1]
+head(Xmat)
+
+# Full Matching
+matchvec <- fullmatch(distmat.propensity, data = life_exp)
+life_exp$matchvec <- matchvec
+
+# Number the strata
+matchedset.index=substr(matchvec,start=3,stop=10)
+matchedset.index.numeric=as.numeric(matchedset.index)
+```
+
+
+Step 3: Check the standardized difference before and after a full match
+```{r}
+# Calculate standardized difference before and after a full match
+# Drop observations with missing values from the calculations
+# stratum.myindex should contain strata for each subject, 0 means a unit was not
+# matched
+# Use harmonic mean weights
+standardized.diff.harmonic.func=function(x,treatment,stratum.myindex,missing=rep(0,length(x))){
+  xtreated=x[treatment==1 & missing==0];
+  xcontrol=x[treatment==0 & missing==0];
+  var.xtreated=var(xtreated);
+  var.xcontrol=var(xcontrol);
+  combinedsd=sqrt(.5*(var.xtreated+var.xcontrol));
+  std.diff.before.matching=(mean(xtreated)-mean(xcontrol))/combinedsd;
+  nostratum=length(unique(stratum.myindex))-1*max(stratum.myindex==0);
+  if(max(stratum.myindex==0)==0){
+    stratumlist=sort(unique(stratum.myindex))
+  }
+  if(max(stratum.myindex==0)==1){
+    templist=sort(unique(stratum.myindex))
+    stratumlist=templist[-1]
+  }
+  diff.in.stratum=rep(0,nostratum);
+  number.in.stratum=rep(0,nostratum);
+  harmonic.weight=rep(0,nostratum)
+  for(i in 1:nostratum){
+    if(sum(stratum.myindex==stratumlist[i] & treatment==1 & missing==0)==0 | sum(stratum.myindex==stratumlist[i] & treatment==0 & missing==0)==0){
+      number.in.stratum[i]=0
+      }
+    if(sum(stratum.myindex==stratumlist[i] & treatment==1 & missing==0)>0 & sum(stratum.myindex==stratumlist[i] & treatment==0 & missing==0)>0){
+      diff.in.stratum[i]=mean(x[stratum.myindex==stratumlist[i] & treatment==1 &
+      missing==0])-mean(x[stratum.myindex==stratumlist[i] & treatment==0 &
+      missing==0]);
+      number.in.stratum[i]=sum(stratum.myindex==stratumlist[i])
+      harmonic.weight[i]=1/(.5/sum(stratum.myindex==stratumlist[i] &
+      treatment==1)+.5/sum(stratum.myindex==stratumlist[i] & treatment==0))
+      }
+  }
+  std.diff.after.matching=(sum(harmonic.weight*diff.in.stratum)/sum(harmonic.weight))/combinedsd;
+  list(std.diff.before.matching=std.diff.before.matching,std.diff.after.matching=std.diff.after.matching);
+}
+
+std.diff.before=rep(0,ncol(Xmat));
+std.diff.after=rep(0,ncol(Xmat));
+names(std.diff.before)=names(Xmat[1,]);
+names(std.diff.after)=names(Xmat[1,]);
+for(i in 1:ncol(Xmat)){
+  missing.temp=is.na(Xmat[,i])
+  temp.stand.diff=standardized.diff.harmonic.func(Xmat[,i],life_exp$treated,matchedset.index.numeric,missing.temp);
+  std.diff.before[i]=temp.stand.diff$std.diff.before.matching;
+  std.diff.after[i]=temp.stand.diff$std.diff.after.matching;
+}
+
+sd.bf=std.diff.before
+sd.af=std.diff.after
+options(digits=2)
+cbind(sd.bf,sd.af)
+
+```
+Step 4: Check the effect of schooling on life expectancy
+```{r}
+# M-test
+# Put data into format for senfmCI function
+library(sensitivityfull)
+stratum.myindex=matchedset.index.numeric
+nostratum=length(unique(stratum.myindex))-1*max(stratum.myindex==0);
+if(max(stratum.myindex==0)==0){
+  stratumlist=sort(unique(stratum.myindex))
+}
+if(max(stratum.myindex==0)==1){
+  templist=sort(unique(stratum.myindex))
+  stratumlist=templist[-1]
+}
+treated1=rep(0,nostratum)
+stratumsize=rep(0,nostratum)
+for(i in 1:nostratum){
+  stratumsize[i]=sum(stratum.myindex==stratumlist[i])
+}
+y=matrix(rep(NA,nostratum*max(stratumsize)),nrow=nostratum)
+for(i in 1:nostratum){
+  no.treated.in.stratum=sum(stratum.myindex==stratumlist[i] & life_exp$treated==1)
+  no.control.in.stratum=sum(stratum.myindex==stratumlist[i] & life_exp$treated==0)
+  treated.in.stratum=which(stratum.myindex==stratumlist[i] & life_exp$treated==1)
+  control.in.stratum=which(stratum.myindex==stratumlist[i] & life_exp$treated==0)
+  if(no.treated.in.stratum==1){
+    y[i,1]=life_exp$outcome[treated.in.stratum]
+    y[i,2:(no.control.in.stratum+1)]=life_exp$outcome[control.in.stratum]
+    treated1[i]=1
+  }
+  if(no.treated.in.stratum>1){
+    y[i,1]=life_exp$outcome[control.in.stratum]
+    y[i,2:(no.treated.in.stratum+1)]=life_exp$outcome[treated.in.stratum]
+    treated1[i]=0
+  }
+}
+treated1=as.logical(treated1)
+senfmCI(y,treated1)
+
+## schooling >= 12, on average 0.98 more life expectancy
+```
+Step 5: Test unmeasured confounders - Sensitivity analysis
+
+```{r}
+
+library(sensitivitymv)
+
+treated_exp <- life_exp$Life.expectancy[life_exp$treated == 1]
+control_exp <- life_exp[matchedset.index.numeric,]$Life.expectancy[life_exp$treated == 1]
+exp_diff <- treated_exp - control_exp
+
+treatment_indicator <- rep(1, nrow(life_exp))
+senmv(exp_diff, gamma = 1)
+senmv(exp_diff, gamma = 5)
+senmv(exp_diff, gamma = 5.1)
+senmv(exp_diff, gamma = 5.2)
+```
+
